@@ -80,6 +80,11 @@ export const NavigatorPalettes = ({
 
   const dispatch = useAppDispatch();
 
+  const selectedPalette = useMemo(
+    () => allPalettes.find((palette) => palette.id === selectedId),
+    [allPalettes, selectedId],
+  );
+
   const setSelectedId = useCallback(
     (id: string) => {
       dispatch(navigationActions.setNavigationId(id));
@@ -93,6 +98,23 @@ export const NavigatorPalettes = ({
       dispatch(entitiesActions.addPalette());
     },
     [dispatch],
+  );
+
+  const duplicateSelectedPalette = useCallback(
+    (e: React.MouseEvent<HTMLButtonElement, MouseEvent>) => {
+      e.stopPropagation();
+      if (!selectedPalette) {
+        return;
+      }
+      const action = entitiesActions.duplicatePalette({
+        paletteId: selectedPalette.id,
+      });
+      dispatch(action);
+      dispatch(
+        navigationActions.setNavigationId(action.payload.newPaletteId),
+      );
+    },
+    [dispatch, selectedPalette],
   );
 
   const [renameId, setRenameId] = useState("");
@@ -195,6 +217,16 @@ export const NavigatorPalettes = ({
               onClick={addNewPalette}
             >
               <PlusIcon />
+            </Button>
+            <FixedSpacer width={5} />
+            <Button
+              variant="transparent"
+              size="small"
+              title={l10n("FIELD_DUPLICATE")}
+              onClick={duplicateSelectedPalette}
+              disabled={!selectedPalette}
+            >
+              ++
             </Button>
             <FixedSpacer width={5} />
             <Button

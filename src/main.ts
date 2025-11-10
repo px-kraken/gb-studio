@@ -196,10 +196,14 @@ const l10nManager = new L10nManager();
 const templateManager = new TemplateManager();
 
 const isDevMode = !!process.execPath.match(/[\\/]electron/);
+const shouldSkipDevTools =
+  process.env.GBSTUDIO_SKIP_DEVTOOLS === "1" ||
+  process.env.GBSTUDIO_SKIP_DEVTOOLS?.toLowerCase() === "true" ||
+  process.env.CI === "true";
 
 const validProjectExt = [".json", ".gbsproj"];
 
-if (isDevMode) {
+if (isDevMode && !shouldSkipDevTools) {
   app.whenReady().then(() => {
     installExtension([REACT_DEVELOPER_TOOLS, REDUX_DEVTOOLS])
       .then((name) => console.log(`Added Extension:  ${name}`))

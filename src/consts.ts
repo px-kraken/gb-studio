@@ -2,15 +2,23 @@ import { normalize } from "path";
 import type { Palette } from "shared/lib/entities/entitiesTypes";
 import { CollisionTileDef, Settings } from "shared/lib/resources/types";
 
-const isDist = __dirname.indexOf(".webpack") > -1;
-const isCli = __dirname.indexOf("out/cli") > -1;
+const normalizedDir = __dirname.replace(/\\/g, "/");
+const isDist = normalizedDir.includes(".webpack");
+const isCli = normalizedDir.includes("out/cli");
 
-let rootDir = __dirname.substring(0, __dirname.lastIndexOf("node_modules"));
+const getRootFromIndex = (index: number) =>
+  index > -1 ? __dirname.substring(0, index) : "";
+
+let rootDir = getRootFromIndex(normalizedDir.lastIndexOf("node_modules"));
 if (isDist) {
-  rootDir = __dirname.substring(0, __dirname.lastIndexOf(".webpack"));
+  rootDir = getRootFromIndex(normalizedDir.lastIndexOf(".webpack"));
 } else if (isCli) {
-  rootDir = __dirname.substring(0, __dirname.lastIndexOf("out/cli"));
+  rootDir = getRootFromIndex(normalizedDir.lastIndexOf("out/cli"));
 } else if (process.env.NODE_ENV === "test") {
+  rootDir = normalize(`${__dirname}/../`);
+}
+
+if (!rootDir) {
   rootDir = normalize(`${__dirname}/../`);
 }
 

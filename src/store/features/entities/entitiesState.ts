@@ -3652,6 +3652,54 @@ const addPalette: CaseReducer<
   palettesAdapter.addOne(state.palettes, newPalette);
 };
 
+const duplicatePalette: CaseReducer<
+  EntitiesState,
+  PayloadAction<{ paletteId: string; newPaletteId: string }>
+> = (state, action) => {
+  const sourcePalette = state.palettes.entities[action.payload.paletteId];
+
+  if (!sourcePalette) {
+    return;
+  }
+
+  const paletteIndex = state.palettes.ids.indexOf(sourcePalette.id);
+  const fallbackName = paletteName(
+    sourcePalette,
+    paletteIndex > -1 ? paletteIndex : localPaletteSelectTotal(state),
+  );
+  const baseName =
+    sourcePalette.name && sourcePalette.name.trim().length
+      ? sourcePalette.name
+      : fallbackName;
+
+  const existingNames = new Set(
+    state.palettes.ids
+      .map((id) => state.palettes.entities[id]?.name)
+      .filter((value): value is string => Boolean(value && value.trim())),
+  );
+
+  let name = baseName;
+  if (name && name.trim()) {
+    let suffix = 2;
+    while (existingNames.has(name)) {
+      name = `${baseName} (${suffix})`;
+      suffix += 1;
+    }
+  } else {
+    name = l10n("TOOL_PALETTE_N", {
+      number: localPaletteSelectTotal(state) + 1,
+    });
+  }
+
+  const duplicatedPalette: Palette = {
+    id: action.payload.newPaletteId,
+    name,
+    colors: [...sourcePalette.colors] as Palette["colors"],
+  };
+
+  palettesAdapter.addOne(state.palettes, duplicatedPalette);
+};
+
 const editPalette: CaseReducer<
   EntitiesState,
   PayloadAction<{ paletteId: string; changes: Partial<Palette> }>
@@ -4766,6 +4814,15 @@ const entitiesSlice = createSlice({
           },
         };
       },
+    },
+    duplicatePalette: {
+      reducer: duplicatePalette,
+      prepare: (payload: { paletteId: string }) => ({
+        payload: {
+          paletteId: payload.paletteId,
+          newPaletteId: uuid(),
+        },
+      }),
     },
     editPalette,
     removePalette,
