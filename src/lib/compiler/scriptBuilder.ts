@@ -226,6 +226,16 @@ export interface ScriptBuilderOptions {
   debugEnabled: boolean;
   compiledAssetsCache: Record<string, string>;
   compileEvents: (self: ScriptBuilder, events: ScriptEvent[]) => void;
+  warnings?: (msg: string) => void;
+  transientBindingUsage?: Record<
+    string,
+    {
+      target: string;
+      aliases: Record<string, true>;
+      scenes: Record<string, true>;
+      resetScenes: Record<string, true>;
+    }
+  >;
 }
 
 type ScriptBuilderMoveType = "horizontal" | "vertical" | "diagonal";
@@ -383,6 +393,24 @@ const getVariableId = (variable: string, entity?: ScriptBuilderEntity) => {
     return variable;
   }
   return String(parseInt(variable || "0"));
+};
+
+const parseLocalGlobalBinding = (name: string) => {
+  const match = name.match(
+    /^(?<alias>[PT]_[^=]+?)\s*=>\s*(?<target>[A-Za-z0-9_:-]+)(?<flags>(?:\s+![A-Za-z_]+)*)\s*$/,
+  );
+  if (!match?.groups?.target) {
+    return null;
+  }
+  const flags = (match.groups.flags ?? "")
+    .split(/\s+/)
+    .filter((token) => token.startsWith("!"))
+    .map((token) => token.toLowerCase());
+  return {
+    alias: match.groups.alias,
+    target: match.groups.target,
+    autoReset: flags.includes("!reset") || flags.includes("!auto_reset"),
+  };
 };
 
 const toValidLabel = (label: string): string => {
@@ -732,6 +760,8 @@ class ScriptBuilder {
   labelStackSize: Record<string, number>;
   includeParams: number[];
   headers: string[];
+  globalVariableTargetLookup: Record<string, string>;
+  localBindingWarnings: Set<string>;
 
   constructor(
     output: ScriptOutput,
@@ -794,6 +824,8 @@ class ScriptBuilder {
     this.labelStackSize = {};
     this.includeParams = [];
     this.headers = ["vm.i", "data/game_globals.i"];
+    this.globalVariableTargetLookup = {};
+    this.localBindingWarnings = new Set();
   }
 
   // --------------------------------------------------------------------------
@@ -5866,6 +5898,14 @@ extern void __mute_mask_${symbol};
       scene,
     } = this.options;
 
+    const localGlobalBindingAlias =
+      typeof variable === "string"
+        ? this.resolveLocalGlobalBindingAlias(variable)
+        : undefined;
+    if (localGlobalBindingAlias) {
+      return localGlobalBindingAlias;
+    }
+
     const id = getVariableId(variable, entity);
 
     const namedVariable = variablesLookup[id || "0"];
@@ -5932,6 +5972,112 @@ extern void __mute_mask_${symbol};
     };
 
     return newAlias;
+  };
+
+  private resolveLocalGlobalBindingAlias = (variable: string) => {
+    if (!isVariableLocal(variable) || !this.options.entity) {
+      return undefined;
+    }
+
+    const localId = getVariableId(variable, this.options.entity);
+    const localVariable = this.options.variablesLookup[localId];
+    if (!localVariable?.name) {
+      return undefined;
+    }
+
+    const binding = parseLocalGlobalBinding(localVariable.name);
+    if (!binding) {
+      return undefined;
+    }
+
+    const globalId = this.resolveGlobalVariableTarget(binding.target);
+    if (!globalId) {
+      this.warnLocalBindingOnce(`${localId}::missing-target::${binding.target}`);
+      return undefined;
+    }
+
+    const globalVariable = this.options.variablesLookup[globalId];
+    if (!globalVariable?.symbol) {
+      this.warnLocalBindingOnce(`${localId}::missing-symbol::${globalId}`);
+      return undefined;
+    }
+
+    const symbol = globalVariable.symbol.toUpperCase();
+    this.options.variableAliasLookup[globalId] = {
+      symbol,
+      name: globalVariable.name,
+      id: globalId,
+      isLocal: false,
+      entityType: "scene",
+      entityId: "",
+      sceneId: "",
+    };
+
+    if (binding.alias.startsWith("T_")) {
+      const usage = this.options.transientBindingUsage;
+      if (usage) {
+        const sceneId = this.options.scene?.id;
+        usage[globalId] = usage[globalId] ?? {
+          target: globalId,
+          aliases: {},
+          scenes: {},
+          resetScenes: {},
+        };
+        usage[globalId].aliases[binding.alias] = true;
+        if (sceneId) {
+          usage[globalId].scenes[sceneId] = true;
+        }
+        if (
+          binding.autoReset &&
+          sceneId &&
+          this.options.entityType === "scene" &&
+          this.options.entityScriptKey === "script"
+        ) {
+          usage[globalId].resetScenes[sceneId] = true;
+        }
+      }
+    }
+
+    return symbol;
+  };
+
+  private resolveGlobalVariableTarget = (target: string) => {
+    const { variablesLookup } = this.options;
+
+    const direct = variablesLookup[target];
+    if (direct && /^[0-9]+$/.test(direct.id)) {
+      return direct.id;
+    }
+
+    const cacheKey = target.toLowerCase();
+    const cached = this.globalVariableTargetLookup[cacheKey];
+    if (cached) {
+      return cached;
+    }
+
+    const globalVariable = Object.values(variablesLookup).find(
+      (variable) =>
+        /^[0-9]+$/.test(variable.id) &&
+        (variable.symbol.toLowerCase() === cacheKey ||
+          variable.name.toLowerCase() === cacheKey),
+    );
+
+    if (!globalVariable) {
+      return undefined;
+    }
+
+    this.globalVariableTargetLookup[cacheKey] = globalVariable.id;
+    return globalVariable.id;
+  };
+
+  private warnLocalBindingOnce = (key: string) => {
+    if (this.localBindingWarnings.has(key)) {
+      return;
+    }
+    this.localBindingWarnings.add(key);
+    this.options.warnings?.(
+      `Unable to resolve local/global variable binding: ${key}. Expected format "P_name => <global_id|symbol|name>" or "T_name => <global_id|symbol|name>".`,
+    );
   };
 
   getConstantSymbol = (id: string): string => {

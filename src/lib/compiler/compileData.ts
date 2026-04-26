@@ -1437,6 +1437,15 @@ const compile = async (
   const additionalScriptsCache: Record<string, string> = {};
   const recursiveSymbolMap: Record<string, string> = {};
   const compiledAssetsCache: Record<string, string> = {};
+  const transientBindingUsage: Record<
+    string,
+    {
+      target: string;
+      aliases: Record<string, true>;
+      scenes: Record<string, true>;
+      resetScenes: Record<string, true>;
+    }
+  > = {};
 
   const eventPtrs: PrecompiledSceneEventPtrs[] = precompiled.sceneData.map(
     (scene, sceneIndex) => {
@@ -1526,6 +1535,7 @@ const compile = async (
           additionalScriptsCache,
           recursiveSymbolMap,
           compiledAssetsCache,
+          transientBindingUsage,
           branch: false,
           isFunction: false,
           debugEnabled,
@@ -1974,6 +1984,25 @@ const compile = async (
   );
 
   const variableMap = keyBy(Object.values(variableAliasLookup), "symbol");
+
+  Object.values(transientBindingUsage).forEach((binding) => {
+    const sceneIds = Object.keys(binding.scenes);
+    if (sceneIds.length <= 1) {
+      return;
+    }
+    const missingResetSceneIds = sceneIds.filter(
+      (sceneId) => !binding.resetScenes[sceneId],
+    );
+    if (missingResetSceneIds.length === 0) {
+      return;
+    }
+    const aliasList = Object.keys(binding.aliases).sort().join(", ");
+    warnings(
+      `Transient alias bindings (${aliasList}) share global variable ${binding.target} across ${sceneIds.length} scenes, but reset marker (!reset or !auto_reset) was not found in scene init for scenes: ${missingResetSceneIds.join(
+        ", ",
+      )}. Add a reset marker in local alias names and reset these variables in scene init scripts.`,
+    );
+  });
 
   output[`data_bootstrap.h`] =
     `#ifndef DATA_PTRS_H\n#define DATA_PTRS_H\n\n` +
