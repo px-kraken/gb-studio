@@ -104,12 +104,22 @@ const makeBuild = async ({
 
   env.GBDK_COMPILER_PRESET = String(settings.compilerPreset);
 
+  // Clear per-source object files before restoring cache so changed sources
+  // can't accidentally reuse stale .o outputs from previous runs.
+  const resetObjFilesStartedAt = Date.now();
+  const objFiles = (await buildLinkFile(buildRoot))
+    .split("\n")
+    .filter((filename) => filename.length > 0);
+  await Promise.all(objFiles.map((objFile) => fs.remove(objFile)));
+  logTiming(progress, "makeBuild.resetObjFiles", resetObjFilesStartedAt);
+  progress(`[stats] makeBuild resetObjFiles removed=${objFiles.length}`);
+
   // Populate /obj with cached data
   const fetchObjCacheStartedAt = Date.now();
   const cacheFetchStats = await fetchCachedObjData(buildRoot, tmpPath, env);
   logTiming(progress, "makeBuild.fetchCachedObjData", fetchObjCacheStartedAt);
   progress(
-    `[stats] objCache fetch sourceFiles=${cacheFetchStats.sourceFiles} hits=${cacheFetchStats.cacheHits} misses=${cacheFetchStats.cacheMisses}`,
+    `[stats] objCache fetch sourceFiles=${cacheFetchStats.sourceFiles} hits=${cacheFetchStats.cacheHits} misses=${cacheFetchStats.cacheMisses} staleRemoved=${cacheFetchStats.staleObjectsRemoved}`,
   );
 
   // Compile Source Files

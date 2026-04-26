@@ -6057,6 +6057,7 @@ extern void __mute_mask_${symbol};
 
     const globalVariable = Object.values(variablesLookup).find(
       (variable) =>
+        !!variable &&
         /^[0-9]+$/.test(variable.id) &&
         (variable.symbol.toLowerCase() === cacheKey ||
           variable.name.toLowerCase() === cacheKey),

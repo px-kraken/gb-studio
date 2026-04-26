@@ -2,7 +2,7 @@ import glob from "glob";
 import Path from "path";
 import { promisify } from "util";
 import os from "os";
-import { ensureDir, copyFile, readFile, pathExists } from "fs-extra";
+import { ensureDir, copyFile, readFile, pathExists, remove } from "fs-extra";
 import { checksumString } from "lib/helpers/checksum";
 
 const globAsync = promisify(glob);
@@ -183,6 +183,7 @@ export type ObjCacheFetchStats = {
   sourceFiles: number;
   cacheHits: number;
   cacheMisses: number;
+  staleObjectsRemoved: number;
 };
 
 export const fetchCachedObjData = async (
@@ -202,6 +203,7 @@ export const fetchCachedObjData = async (
 
   const srcFiles = await globAsync(`${buildSrcRoot}/**/*.{c,s}`);
   let cacheHits = 0;
+  let staleObjectsRemoved = 0;
 
   await processInConcurrency(srcFiles, async (srcFilePath) => {
     const cacheFilename = await fileChecksum(
@@ -218,6 +220,14 @@ export const fetchCachedObjData = async (
       await ensureDir(Path.dirname(outFile));
       await copyFile(cacheFile, outFile);
       cacheHits += 1;
+    } else {
+      // Important: if cache misses but a stale object file exists from a previous
+      // run, remove it so getBuildCommands recompiles this source.
+      const staleObjFile = toObjFilePath(buildRoot, srcFilePath);
+      if (await pathExists(staleObjFile)) {
+        await remove(staleObjFile);
+        staleObjectsRemoved += 1;
+      }
     }
   });
 
@@ -225,5 +235,6 @@ export const fetchCachedObjData = async (
     sourceFiles: srcFiles.length,
     cacheHits,
     cacheMisses: srcFiles.length - cacheHits,
+    staleObjectsRemoved,
   };
 };
