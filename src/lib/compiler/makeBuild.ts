@@ -14,6 +14,7 @@ import { ProjectResources } from "shared/lib/resources/types";
 import psTree from "ps-tree";
 import { promisify } from "util";
 import { envWith } from "lib/helpers/cli/env";
+import { checksumString } from "lib/helpers/checksum";
 
 const psTreeAsync = promisify(psTree);
 
@@ -31,6 +32,14 @@ type MakeOptions = {
 const cpuCount = os.cpus().length;
 const childSet = new Set<ChildProcess>();
 let cancelling = false;
+
+const logTiming = (
+  progress: (msg: string) => void,
+  label: string,
+  startedAt: number,
+) => {
+  progress(`[timing] ${label}: ${Date.now() - startedAt}ms`);
+};
 
 const makeBuild = async ({
   buildRoot = "/tmp",
@@ -51,7 +60,9 @@ const makeBuild = async ({
   const targetPlatform = buildType === "pocket" ? "pocket" : "gb";
   const batterylessEnabled = settings.batterylessEnabled && buildType !== "web";
 
+  const ensureBuildToolsStartedAt = Date.now();
   const buildToolsPath = await ensureBuildTools(tmpPath);
+  logTiming(progress, "makeBuild.ensureBuildTools", ensureBuildToolsStartedAt);
   const buildToolsVersion = await fs.readFile(
     `${buildToolsPath}/tools_version`,
     "utf8",
@@ -94,9 +105,15 @@ const makeBuild = async ({
   env.GBDK_COMPILER_PRESET = String(settings.compilerPreset);
 
   // Populate /obj with cached data
-  await fetchCachedObjData(buildRoot, tmpPath, env);
+  const fetchObjCacheStartedAt = Date.now();
+  const cacheFetchStats = await fetchCachedObjData(buildRoot, tmpPath, env);
+  logTiming(progress, "makeBuild.fetchCachedObjData", fetchObjCacheStartedAt);
+  progress(
+    `[stats] objCache fetch sourceFiles=${cacheFetchStats.sourceFiles} hits=${cacheFetchStats.cacheHits} misses=${cacheFetchStats.cacheMisses}`,
+  );
 
   // Compile Source Files
+  const getBuildCommandsStartedAt = Date.now();
   const makeCommands = await getBuildCommands(buildRoot, {
     colorEnabled,
     sgb: sgbEnabled,
@@ -108,6 +125,17 @@ const makeBuild = async ({
     cartType: settings.cartType,
     compilerPreset: settings.compilerPreset,
   });
+  logTiming(progress, "makeBuild.getBuildCommands", getBuildCommandsStartedAt);
+  progress(`[stats] makeBuild compileUnits=${makeCommands.length}`);
+
+  if (cacheFetchStats.cacheHits === 0 && makeCommands.length === 0) {
+    const repairObjCacheStartedAt = Date.now();
+    const repairedCacheStats = await cacheObjData(buildRoot, tmpPath, env);
+    logTiming(progress, "makeBuild.repairObjCache", repairObjCacheStartedAt);
+    progress(
+      `[stats] objCache repair sourceFiles=${repairedCacheStats.sourceFiles} stored=${repairedCacheStats.cachedObjects}`,
+    );
+  }
 
   const options = {
     cwd: buildRoot,
@@ -116,6 +144,7 @@ const makeBuild = async ({
   };
 
   // Build source files in parallel
+  const compileSourcesStartedAt = Date.now();
   const concurrency = cpuCount;
   await Promise.all(
     Array(concurrency)
@@ -145,6 +174,7 @@ const makeBuild = async ({
         }
       }),
   );
+  logTiming(progress, "makeBuild.compileSources", compileSourcesStartedAt);
 
   const compiledSrcFiles = makeCommands.map((makeCommand) =>
     Path.join(buildRoot, makeCommand.srcFile),
@@ -163,6 +193,7 @@ const makeBuild = async ({
   }
 
   progress(`${l10n("COMPILER_LINKING")}...`);
+  const prepareLinkStartedAt = Date.now();
   const linkFile = await buildLinkFile(buildRoot);
   const linkFilePath = `${buildRoot}/obj/linkfile.lk`;
   await fs.writeFile(linkFilePath, linkFile);
@@ -184,33 +215,81 @@ const makeBuild = async ({
     debug,
     targetPlatform,
   );
+  logTiming(progress, "makeBuild.prepareLinkInputs", prepareLinkStartedAt);
 
-  const { completed: linkCompleted, child } = spawn(
-    linkCommand,
-    linkArgs,
-    options,
-    {
-      onLog: (msg) => progress(msg),
-      onError: (msg) => {
-        if (msg.indexOf("Converted build") > -1) {
-          return;
-        }
-        warnings(msg);
-      },
-    },
+  const linkCacheStartedAt = Date.now();
+  const linkCacheRoot = `${tmpPath}/_gbscache/link`;
+  const linkFingerprint = checksumString(
+    [buildToolsVersion, linkFile, linkArgs.join("\n")].join("\n---\n"),
   );
+  const linkCacheDir = `${linkCacheRoot}/${linkFingerprint}`;
+  const linkCacheRomDir = `${linkCacheDir}/rom`;
+  await fs.ensureDir(linkCacheRoot);
 
-  childSet.add(child);
-  await linkCompleted;
-  childSet.delete(child);
+  const canReuseLinkedOutput = makeCommands.length === 0;
+  let linkCacheHit = false;
+
+  if (canReuseLinkedOutput && (await fs.pathExists(linkCacheRomDir))) {
+    await fs.remove(`${buildRoot}/build/rom`);
+    await fs.copy(linkCacheRomDir, `${buildRoot}/build/rom`);
+    linkCacheHit = true;
+    progress(`[stats] makeBuild linkCache=hit`);
+  } else {
+    progress(
+      `[stats] makeBuild linkCache=miss reason=${canReuseLinkedOutput ? "cache-not-found" : "objects-recompiled"}`,
+    );
+  }
+  logTiming(progress, "makeBuild.linkCacheLookup", linkCacheStartedAt);
+
+  if (!linkCacheHit) {
+    const { completed: linkCompleted, child } = spawn(
+      linkCommand,
+      linkArgs,
+      options,
+      {
+        onLog: (msg) => progress(msg),
+        onError: (msg) => {
+          if (msg.indexOf("Converted build") > -1) {
+            return;
+          }
+          warnings(msg);
+        },
+      },
+    );
+
+    childSet.add(child);
+    const linkStartedAt = Date.now();
+    await linkCompleted;
+    childSet.delete(child);
+    logTiming(progress, "makeBuild.link", linkStartedAt);
+
+    const storeLinkCacheStartedAt = Date.now();
+    await fs.remove(linkCacheRomDir);
+    await fs.copy(`${buildRoot}/build/rom`, linkCacheRomDir);
+    logTiming(progress, "makeBuild.storeLinkCache", storeLinkCacheStartedAt);
+  } else {
+    progress(`[timing] makeBuild.link: 0ms`);
+  }
 
   // Export game globals to ROM directory
+  const exportGlobalsStartedAt = Date.now();
   const gameGlobalsPath = `${buildRoot}/include/data/game_globals.i`;
   const gameGlobalsExportPath = `${buildRoot}/build/rom/globals.i`;
   await fs.copyFile(gameGlobalsPath, gameGlobalsExportPath);
+  logTiming(progress, "makeBuild.exportGlobals", exportGlobalsStartedAt);
 
   // Store /obj in cache
-  await cacheObjData(buildRoot, tmpPath, env, compiledSrcFiles);
+  const cacheObjDataStartedAt = Date.now();
+  const cacheStoreStats = await cacheObjData(
+    buildRoot,
+    tmpPath,
+    env,
+    compiledSrcFiles,
+  );
+  logTiming(progress, "makeBuild.cacheObjData", cacheObjDataStartedAt);
+  progress(
+    `[stats] objCache store sourceFiles=${cacheStoreStats.sourceFiles} stored=${cacheStoreStats.cachedObjects}`,
+  );
 };
 
 export const cancelBuildCommandsInProgress = async () => {

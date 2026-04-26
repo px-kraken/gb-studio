@@ -1,9 +1,8 @@
 import fs from "fs-extra";
-import rimraf from "rimraf";
-import { promisify } from "util";
 import Path from "path";
 import { defaultEngineMetaPath, defaultEngineRoot } from "consts";
 import copy from "lib/helpers/fsCopy";
+import { checksumString } from "lib/helpers/checksum";
 import ejectEngineChangelog, {
   isKnownEngineVersion,
 } from "lib/project/ejectEngineChangelog";
@@ -33,7 +32,20 @@ const engineIgnore = [
   "scheme2.png",
 ];
 
-const rmdir = promisify(rimraf);
+const generatedManifestFile = `.gbs_generated_files.json`;
+const defaultEngineVersionFile = `.gbs_default_engine_version`;
+
+type GeneratedManifest = {
+  files: Record<string, string>;
+};
+
+const logTiming = (
+  progress: (msg: string) => void,
+  label: string,
+  startedAt: number,
+) => {
+  progress(`[timing] ${label}: ${Date.now() - startedAt}ms`);
+};
 
 type EjectOptions = {
   engineSchema: EngineSchema;
@@ -61,26 +73,49 @@ const ejectBuild = async ({
 }: EjectOptions) => {
   const localCorePath = `${projectRoot}/assets/engine`;
   const pluginsPath = `${projectRoot}/plugins`;
+  const ensureBuildToolsStartedAt = Date.now();
   const buildToolsPath = await ensureBuildTools(tmpPath);
+  logTiming(progress, "ejectBuild.ensureBuildTools", ensureBuildToolsStartedAt);
   const { settings } = projectData;
   const colorEnabled = settings.colorMode !== "mono";
   const { fields: engineFields, sceneTypes } = engineSchema;
 
-  progress(`${l10n("COMPILER_REMOVING_FOLDER")} ${Path.basename(outputRoot)}`);
-  await rmdir(outputRoot);
   await fs.ensureDir(outputRoot);
   progress(l10n("COMPILER_COPY_DEFAULT_ENGINE"));
 
-  await copy(defaultEngineRoot, outputRoot, {
-    ignore: (path) => {
-      return engineIgnore.some((ignoreDir) =>
-        path.startsWith(Path.join(defaultEngineRoot, ignoreDir)),
-      );
-    },
-  });
-
   const expectedEngineVersion = await readEngineVersion(defaultEngineMetaPath);
+  const defaultEngineVersionPath = Path.join(outputRoot, defaultEngineVersionFile);
+  let previousDefaultEngineVersion = "";
+  try {
+    previousDefaultEngineVersion = await fs.readFile(
+      defaultEngineVersionPath,
+      "utf8",
+    );
+  } catch (e) {}
 
+  const copyDefaultEngineStartedAt = Date.now();
+  if (
+    previousDefaultEngineVersion === expectedEngineVersion &&
+    (await fs.pathExists(`${outputRoot}/Makefile`))
+  ) {
+    progress(`[stats] ejectBuild copyDefaultEngine=skipped`);
+  } else {
+    await copy(defaultEngineRoot, outputRoot, {
+      overwrite: previousDefaultEngineVersion !== expectedEngineVersion,
+      ignore: (path) => {
+        return engineIgnore.some((ignoreDir) =>
+          path.startsWith(Path.join(defaultEngineRoot, ignoreDir)),
+        );
+      },
+    });
+    await fs.writeFile(defaultEngineVersionPath, expectedEngineVersion);
+    progress(
+      `[stats] ejectBuild copyDefaultEngine=${previousDefaultEngineVersion ? "refreshed" : "seeded"}`,
+    );
+  }
+  logTiming(progress, "ejectBuild.copyDefaultEngine", copyDefaultEngineStartedAt);
+
+  const copyLocalEngineStartedAt = Date.now();
   try {
     progress(
       l10n("COMPILER_LOOKING_FOR_LOCAL_ENGINE", { path: "assets/engine" }),
@@ -116,6 +151,7 @@ const ejectBuild = async ({
   } catch (e) {
     progress(l10n("COMPILER_LOCAL_ENGINE_NOT_FOUND"));
   }
+  logTiming(progress, "ejectBuild.copyLocalEngine", copyLocalEngineStartedAt);
 
   // Remove unused scene type files
   const usedSceneTypes = sceneTypes.filter((type) =>
@@ -151,6 +187,7 @@ const ejectBuild = async ({
   progress(
     l10n("COMPILER_LOOKING_FOR_ENGINE_PLUGINS", { path: "plugins/*/engine" }),
   );
+  const applyEnginePluginsStartedAt = Date.now();
   const enginePlugins = glob.sync(`${pluginsPath}/**/engine`);
   for (const enginePluginPath of enginePlugins) {
     progress(
@@ -184,8 +221,10 @@ const ejectBuild = async ({
     }
     await copy(enginePluginPath, outputRoot);
   }
+  logTiming(progress, "ejectBuild.applyEnginePlugins", applyEnginePluginsStartedAt);
 
   // Modify engineField defines for any engine fields that define a "file" field
+  const applyEngineDefinesStartedAt = Date.now();
   await Promise.all(
     engineFields
       .filter(
@@ -235,6 +274,7 @@ const ejectBuild = async ({
         await fs.writeFile(filename, source);
       }),
   );
+  logTiming(progress, "ejectBuild.applyEngineDefines", applyEngineDefinesStartedAt);
 
   await fs.ensureDir(`${outputRoot}/include/data`);
   await fs.ensureDir(`${outputRoot}/src/data`);
@@ -243,26 +283,97 @@ const ejectBuild = async ({
   await fs.ensureDir(`${outputRoot}/obj`);
   await fs.ensureDir(`${outputRoot}/build/rom`);
 
+  const manifestPath = Path.join(outputRoot, generatedManifestFile);
+  let previousGeneratedChecksums: Record<string, string> = {};
+  try {
+    const parsedManifest = JSON.parse(
+      await fs.readFile(manifestPath, "utf8"),
+    ) as GeneratedManifest | string[];
+    if (Array.isArray(parsedManifest)) {
+      for (const filename of parsedManifest) {
+        previousGeneratedChecksums[filename] = "";
+      }
+    } else {
+      previousGeneratedChecksums = parsedManifest.files ?? {};
+    }
+  } catch (e) {}
+  const generatedFileChecksums: Record<string, string> = {};
+  let generatedFilesWritten = 0;
+  let generatedFilesUnchanged = 0;
+
+  const writeGeneratedFile = async (filename: string, contents: string) => {
+    const checksum = checksumString(contents);
+    generatedFileChecksums[filename] = checksum;
+    const outPath = Path.join(outputRoot, filename);
+    if (
+      previousGeneratedChecksums[filename] === checksum &&
+      (await fs.pathExists(outPath))
+    ) {
+      generatedFilesUnchanged += 1;
+      return;
+    }
+    await fs.ensureDir(Path.dirname(outPath));
+    await fs.writeFile(outPath, contents);
+    generatedFilesWritten += 1;
+  };
+
+  const writeGeneratedFilesStartedAt = Date.now();
   for (const filename in compiledData.files) {
     if (filename.endsWith(".h") || filename.endsWith(".i")) {
-      await fs.writeFile(
-        `${outputRoot}/include/data/${filename}`,
+      await writeGeneratedFile(
+        `include/data/${filename}`,
         compiledData.files[filename],
       );
     } else if (filename.endsWith(".o")) {
-      await fs.writeFile(
-        `${outputRoot}/obj/${filename}`,
+      await writeGeneratedFile(
+        `obj/${filename}`,
         compiledData.files[filename],
       );
     } else {
-      await fs.writeFile(
-        `${outputRoot}/src/data/${filename}`,
+      await writeGeneratedFile(
+        `src/data/${filename}`,
         compiledData.files[filename],
       );
     }
   }
+  logTiming(progress, "ejectBuild.writeGeneratedFiles", writeGeneratedFilesStartedAt);
+
+  const cleanupGeneratedFilesStartedAt = Date.now();
+  let removedStaleGeneratedFiles = 0;
+  const generatedFileLookup = new Set(Object.keys(generatedFileChecksums));
+  for (const oldGeneratedFile of Object.keys(previousGeneratedChecksums)) {
+    if (!generatedFileLookup.has(oldGeneratedFile)) {
+      const oldGeneratedPath = Path.join(outputRoot, oldGeneratedFile);
+      if (isFilePathWithinFolder(oldGeneratedPath, outputRoot)) {
+        if (await fs.pathExists(oldGeneratedPath)) {
+          await fs.remove(oldGeneratedPath);
+          removedStaleGeneratedFiles += 1;
+        }
+      }
+    }
+  }
+  await fs.writeFile(
+    manifestPath,
+    JSON.stringify({
+      files: Object.keys(generatedFileChecksums)
+        .sort()
+        .reduce((memo, filename) => {
+          memo[filename] = generatedFileChecksums[filename];
+          return memo;
+        }, {} as Record<string, string>),
+    }),
+  );
+  logTiming(
+    progress,
+    "ejectBuild.cleanupGeneratedFiles",
+    cleanupGeneratedFilesStartedAt,
+  );
+  progress(
+    `[stats] ejectBuild generated writes=${generatedFilesWritten} unchanged=${generatedFilesUnchanged} staleRemoved=${removedStaleGeneratedFiles}`,
+  );
 
   // Generate Makefile
+  const writeMakefilesStartedAt = Date.now();
   await makefileInjectToolsPath(`${outputRoot}/Makefile`, buildToolsPath);
   const makeDotBuildFile = buildMakeDotBuildFile({
     cartType: settings.cartType,
@@ -272,6 +383,7 @@ const ejectBuild = async ({
     musicDriver: settings.musicDriver,
   });
   await fs.writeFile(`${outputRoot}/Makefile.build`, makeDotBuildFile);
+  logTiming(progress, "ejectBuild.writeMakefiles", writeMakefilesStartedAt);
 };
 
 export default ejectBuild;

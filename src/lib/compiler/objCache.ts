@@ -122,12 +122,17 @@ const processInConcurrency = async <T>(
   );
 };
 
+export type ObjCacheStoreStats = {
+  sourceFiles: number;
+  cachedObjects: number;
+};
+
 export const cacheObjData = async (
   buildRoot: string,
   tmpPath: string,
   env: NodeJS.ProcessEnv,
   srcFilesOverride?: string[],
-) => {
+): Promise<ObjCacheStoreStats> => {
   const cacheRoot = Path.normalize(`${tmpPath}/_gbscache/obj`);
   const buildSrcRoot = Path.normalize(`${buildRoot}/src`);
   const buildIncludeRoot = Path.normalize(`${buildRoot}/include`);
@@ -143,6 +148,7 @@ export const cacheObjData = async (
     : await globAsync(`${buildSrcRoot}/**/*.{c,s}`);
 
   const envChecksum = checksumString(JSON.stringify(env));
+  let cachedObjects = 0;
 
   await processInConcurrency(srcFiles, async (srcFilePath) => {
     const objFilePath = toObjFilePath(buildRoot, srcFilePath);
@@ -163,15 +169,27 @@ export const cacheObjData = async (
 
       const outFile = `${cacheRoot}/${cacheFilename}`;
       await copyFile(objFilePath, outFile);
+      cachedObjects += 1;
     }
   });
+
+  return {
+    sourceFiles: srcFiles.length,
+    cachedObjects,
+  };
+};
+
+export type ObjCacheFetchStats = {
+  sourceFiles: number;
+  cacheHits: number;
+  cacheMisses: number;
 };
 
 export const fetchCachedObjData = async (
   buildRoot: string,
   tmpPath: string,
   env: NodeJS.ProcessEnv,
-) => {
+): Promise<ObjCacheFetchStats> => {
   const cacheRoot = Path.normalize(`${tmpPath}/_gbscache/obj`);
   const buildSrcRoot = Path.normalize(`${buildRoot}/src`);
   const buildIncludeRoot = Path.normalize(`${buildRoot}/include`);
@@ -183,6 +201,7 @@ export const fetchCachedObjData = async (
   );
 
   const srcFiles = await globAsync(`${buildSrcRoot}/**/*.{c,s}`);
+  let cacheHits = 0;
 
   await processInConcurrency(srcFiles, async (srcFilePath) => {
     const cacheFilename = await fileChecksum(
@@ -198,6 +217,13 @@ export const fetchCachedObjData = async (
       const outFile = toObjFilePath(buildRoot, srcFilePath);
       await ensureDir(Path.dirname(outFile));
       await copyFile(cacheFile, outFile);
+      cacheHits += 1;
     }
   });
+
+  return {
+    sourceFiles: srcFiles.length,
+    cacheHits,
+    cacheMisses: srcFiles.length - cacheHits,
+  };
 };
