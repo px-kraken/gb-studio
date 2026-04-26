@@ -1,6 +1,7 @@
 import keyBy from "lodash/keyBy";
 import uniq from "lodash/uniq";
 import SparkMD5 from "spark-md5";
+import { checksumString } from "lib/helpers/checksum";
 import { eventHasArg } from "lib/helpers/eventSystem";
 import compileImages from "./compileImages";
 import compileEntityEvents from "./compileEntityEvents";
@@ -165,6 +166,14 @@ export type VariableMapData = {
 };
 
 const indexById = <T extends { id: string }>(arr: T[]) => keyBy(arr, "id");
+
+const buildOutputSignature = (output: Record<string, string>): string => {
+  const outputDigest = Object.keys(output)
+    .sort()
+    .map((filename) => `${filename}\n${output[filename]}`)
+    .join("\n---\n");
+  return checksumString(outputDigest);
+};
 
 const isReference = (value: unknown): value is Reference =>
   !!value &&
@@ -2012,9 +2021,7 @@ const compile = async (
     usedSceneTypeIds,
   });
 
-  output[`game_signature.c`] = compileSaveSignature(
-    JSON.stringify(projectData),
-  );
+  output[`game_signature.c`] = compileSaveSignature(buildOutputSignature(output));
 
   return {
     files: output,

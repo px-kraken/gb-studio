@@ -1,10 +1,25 @@
 import glob from "glob";
 import Path from "path";
 import { promisify } from "util";
+import os from "os";
 import { ensureDir, copyFile, readFile, pathExists } from "fs-extra";
 import { checksumString } from "lib/helpers/checksum";
 
 const globAsync = promisify(glob);
+const ioConcurrency = Math.max(2, Math.min(os.cpus().length, 16));
+
+const toObjFilePath = (buildRoot: string, srcFilePath: string) => {
+  const relativeSourcePath = Path.relative(
+    Path.join(buildRoot, "src"),
+    srcFilePath,
+  )
+    .split(Path.sep)
+    .join("/");
+  return `${buildRoot}/obj/${relativeSourcePath}`.replace(
+    /\.[cs]$/,
+    ".o",
+  );
+};
 
 interface ParsedInclude {
   contents: string;
@@ -64,17 +79,19 @@ const fileChecksum = async (
 const generateIncludesLookup = async (buildIncludeRoot: string) => {
   const allIncludeFiles = await globAsync(`${buildIncludeRoot}/**/*.{h,i}`);
   const includesLookup: IncludesLookup = {};
-  for (const filePath of allIncludeFiles) {
-    const fileContents = await readFile(filePath, "utf8");
-    const key = Path.relative(buildIncludeRoot, filePath)
-      .split(Path.sep)
-      .join(Path.posix.sep);
-    includesLookup[key] = {
-      contents: fileContents,
-      referencedFiles: referencedFiles(fileContents),
-      checksum: checksumString(fileContents),
-    };
-  }
+  await Promise.all(
+    allIncludeFiles.map(async (filePath) => {
+      const fileContents = await readFile(filePath, "utf8");
+      const key = Path.relative(buildIncludeRoot, filePath)
+        .split(Path.sep)
+        .join(Path.posix.sep);
+      includesLookup[key] = {
+        contents: fileContents,
+        referencedFiles: referencedFiles(fileContents),
+        checksum: checksumString(fileContents),
+      };
+    }),
+  );
   return includesLookup;
 };
 
@@ -89,53 +106,65 @@ const generateGameGlobalsLookup = (gameGlobalsContents: string) => {
   return lookup;
 };
 
+const processInConcurrency = async <T>(
+  values: T[],
+  worker: (value: T) => Promise<void>,
+  concurrency = ioConcurrency,
+) => {
+  await Promise.all(
+    Array(concurrency)
+      .fill(values.entries())
+      .map(async (cursor) => {
+        for (const [, value] of cursor) {
+          await worker(value);
+        }
+      }),
+  );
+};
+
 export const cacheObjData = async (
   buildRoot: string,
   tmpPath: string,
   env: NodeJS.ProcessEnv,
+  srcFilesOverride?: string[],
 ) => {
   const cacheRoot = Path.normalize(`${tmpPath}/_gbscache/obj`);
-  const buildObjRoot = Path.normalize(`${buildRoot}/obj`);
   const buildSrcRoot = Path.normalize(`${buildRoot}/src`);
   const buildIncludeRoot = Path.normalize(`${buildRoot}/include`);
 
   await ensureDir(cacheRoot);
-
   const includesLookup = await generateIncludesLookup(buildIncludeRoot);
   const gameGlobalsLookup = generateGameGlobalsLookup(
     includesLookup[GAME_GLOBALS_FILE]?.contents,
   );
 
-  const objFiles = await globAsync(`${buildObjRoot}/*.o`);
-  const srcFiles = await globAsync(`${buildSrcRoot}/**/*.{c,s}`);
+  const srcFiles = srcFilesOverride
+    ? srcFilesOverride.map((filePath) => Path.normalize(filePath))
+    : await globAsync(`${buildSrcRoot}/**/*.{c,s}`);
 
   const envChecksum = checksumString(JSON.stringify(env));
 
-  for (let i = 0; i < objFiles.length; i++) {
-    const objFilePath = objFiles[i];
+  await processInConcurrency(srcFiles, async (srcFilePath) => {
+    const objFilePath = toObjFilePath(buildRoot, srcFilePath);
+    if (!(await pathExists(objFilePath))) {
+      return;
+    }
     const fileName = Path.basename(objFilePath, ".o");
     if (
       fileName.indexOf("bank_") !== 0 &&
       fileName.indexOf("music_bank_") !== 0
     ) {
-      const matchingSrc = srcFiles.find((file) => {
-        const baseName = Path.basename(file);
-        return baseName === `${fileName}.c` || baseName === `${fileName}.s`;
-      });
+      const cacheFilename = await fileChecksum(
+        srcFilePath,
+        includesLookup,
+        gameGlobalsLookup,
+        envChecksum,
+      );
 
-      if (matchingSrc) {
-        const cacheFilename = await fileChecksum(
-          matchingSrc,
-          includesLookup,
-          gameGlobalsLookup,
-          envChecksum,
-        );
-
-        const outFile = `${cacheRoot}/${cacheFilename}`;
-        await copyFile(objFilePath, outFile);
-      }
+      const outFile = `${cacheRoot}/${cacheFilename}`;
+      await copyFile(objFilePath, outFile);
     }
-  }
+  });
 };
 
 export const fetchCachedObjData = async (
@@ -144,7 +173,6 @@ export const fetchCachedObjData = async (
   env: NodeJS.ProcessEnv,
 ) => {
   const cacheRoot = Path.normalize(`${tmpPath}/_gbscache/obj`);
-  const buildObjRoot = Path.normalize(`${buildRoot}/obj`);
   const buildSrcRoot = Path.normalize(`${buildRoot}/src`);
   const buildIncludeRoot = Path.normalize(`${buildRoot}/include`);
 
@@ -156,10 +184,7 @@ export const fetchCachedObjData = async (
 
   const srcFiles = await globAsync(`${buildSrcRoot}/**/*.{c,s}`);
 
-  for (let i = 0; i < srcFiles.length; i++) {
-    const srcFilePath = srcFiles[i];
-    const fileName = Path.basename(srcFilePath).replace(/\.(s|c)$/, "");
-
+  await processInConcurrency(srcFiles, async (srcFilePath) => {
     const cacheFilename = await fileChecksum(
       srcFilePath,
       includesLookup,
@@ -170,8 +195,9 @@ export const fetchCachedObjData = async (
     const cacheFile = `${cacheRoot}/${cacheFilename}`;
 
     if (await pathExists(cacheFile)) {
-      const outFile = `${buildObjRoot}/${fileName}.o`;
+      const outFile = toObjFilePath(buildRoot, srcFilePath);
+      await ensureDir(Path.dirname(outFile));
       await copyFile(cacheFile, outFile);
     }
-  }
+  });
 };

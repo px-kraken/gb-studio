@@ -1,10 +1,23 @@
 import glob from "glob";
 import { promisify } from "util";
-import { pathExists, readFile, writeFile } from "fs-extra";
+import { ensureDir, pathExists, readFile, writeFile } from "fs-extra";
 import Path from "path";
 import l10n from "shared/lib/lang/l10n";
 
 const globAsync = promisify(glob);
+
+const toObjFilePath = (buildRoot: string, srcFilePath: string) => {
+  const relativeSourcePath = Path.relative(
+    Path.join(buildRoot, "src"),
+    srcFilePath,
+  )
+    .split(Path.sep)
+    .join("/");
+  return `${buildRoot}/obj/${relativeSourcePath}`.replace(
+    /\.[cs]$/,
+    ".o",
+  );
+};
 
 type BuildOptions = {
   colorEnabled: boolean;
@@ -49,11 +62,9 @@ export const getBuildCommands = async (
       continue;
     }
 
-    const objFile = `${file
-      .replace(/src.*\//, "obj/")
-      .replace(/\.[cs]$/, "")}.o`;
-
+    const objFile = toObjFilePath(buildRoot, file);
     if (!(await pathExists(objFile))) {
+      await ensureDir(Path.dirname(objFile));
       const buildArgs = [
         `-Iinclude`,
         `-Wa-Iinclude`,
@@ -115,6 +126,7 @@ export const getBuildCommands = async (
         )}`,
         command: CC,
         args: buildArgs,
+        srcFile: Path.relative(buildRoot, file),
       });
     }
   }
@@ -126,9 +138,7 @@ export const buildLinkFile = async (buildRoot: string) => {
   const srcRoot = `${buildRoot}/src/**/*.@(c|s)`;
   const buildFiles = await globAsync(srcRoot);
   for (const file of buildFiles) {
-    const objFile = `${file
-      .replace(/src.*\//, "obj/")
-      .replace(/\.[cs]$/, "")}.o`;
+    const objFile = toObjFilePath(buildRoot, file);
 
     output.push(objFile);
   }

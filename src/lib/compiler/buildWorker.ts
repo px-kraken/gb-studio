@@ -46,6 +46,11 @@ export type BuildTaskResponse =
 
 let terminating = false;
 
+const timingLog = (label: string, startedAt: number) => {
+  const durationMs = Date.now() - startedAt;
+  progress(`[timing] ${label}: ${durationMs}ms`);
+};
+
 const buildProject = async ({
   project,
   projectRoot,
@@ -58,12 +63,17 @@ const buildProject = async ({
   debugEnabled,
   l10nData,
 }: BuildWorkerData) => {
+  const buildStartedAt = Date.now();
+
   // Initialise l10n
   setL10NData(l10nData);
 
   // Load script event handlers + plugins
+  const scriptHandlersStartedAt = Date.now();
   const scriptEventHandlers = await loadAllScriptEventHandlers(projectRoot);
+  timingLog("loadScriptEventHandlers", scriptHandlersStartedAt);
 
+  const compileDataStartedAt = Date.now();
   const compiledData = await compileData(project, {
     projectRoot,
     engineSchema,
@@ -73,7 +83,9 @@ const buildProject = async ({
     progress,
     warnings,
   });
+  timingLog("compileData", compileDataStartedAt);
 
+  const ejectBuildStartedAt = Date.now();
   await ejectBuild({
     projectRoot,
     tmpPath,
@@ -84,14 +96,18 @@ const buildProject = async ({
     progress,
     warnings,
   });
+  timingLog("ejectBuild", ejectBuildStartedAt);
 
+  const validateStartedAt = Date.now();
   await validateEjectedBuild({
     buildRoot: outputRoot,
     progress,
     warnings,
   });
+  timingLog("validateEjectedBuild", validateStartedAt);
 
   if (make) {
+    const makeBuildStartedAt = Date.now();
     await makeBuild({
       buildRoot: outputRoot,
       romFilename,
@@ -102,8 +118,10 @@ const buildProject = async ({
       progress,
       warnings,
     });
+    timingLog("makeBuild", makeBuildStartedAt);
   }
 
+  timingLog("buildProject.total", buildStartedAt);
   return compiledData;
 };
 

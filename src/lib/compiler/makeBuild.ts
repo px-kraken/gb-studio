@@ -146,6 +146,10 @@ const makeBuild = async ({
       }),
   );
 
+  const compiledSrcFiles = makeCommands.map((makeCommand) =>
+    Path.join(buildRoot, makeCommand.srcFile),
+  );
+
   // GBSPack ---
 
   if (cancelling) {
@@ -206,7 +210,7 @@ const makeBuild = async ({
   await fs.copyFile(gameGlobalsPath, gameGlobalsExportPath);
 
   // Store /obj in cache
-  await cacheObjData(buildRoot, tmpPath, env);
+  await cacheObjData(buildRoot, tmpPath, env, compiledSrcFiles);
 };
 
 export const cancelBuildCommandsInProgress = async () => {
